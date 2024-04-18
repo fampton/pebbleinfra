@@ -1,0 +1,200 @@
+---
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Launch EC2 instance
+      amazon.aws.ec2_instance:
+        key_name: "pebble-key"
+        region: "us-east-1"
+        instance_type: "t2.nano"
+        # ubuntu server 22.04
+        image_id: "ami-080e1f13689e07408"
+        # vars found in vars.yaml
+        security_group: "{{ security_group_id }}"
+        vpc_subnet_id: "{{ subnet_id }}"
+        network:
+          assign_public_ip: true
+        tags:
+          # vars found in vars.yaml
+          Name: "{{ instance_tag_name }}"
+        state: "running"
+
+    - name: Register host
+      amazon.aws.ec2_instance_info:
+        filters:
+          "tag:Name": "{{ instance_tag_name }}"
+        region: "us-east-1"
+      register: ec2_info
+
+    - name: Add new instance to host group
+      add_host:
+        hostname: "{{ ec2_info.instances[0].public_ip_address }}"
+        groupname: launched
+        ansible_user: ubuntu
+        ansible_ssh_private_key_file: /home/admin/pebble-key.pem
+
+    - name: Wait for SSH to be available
+      ansible.builtin.wait_for:
+        host: "{{ ec2_info.instances[0].public_ip_address }}"
+        port: 22
+        state: started
+        timeout: 300  # Wait up to 300 seconds
+      delegate_to: localhost
+
+    - name: Save public IP to local file
+      local_action:
+        module: copy
+        content: "{{ ec2_info.instances[0].public_ip_address }}"
+        dest: /home/admin/webapp_ip.txt
+
+    - name: Set A record in Route 53
+      community.aws.route53:
+        state: present
+        zone: "pebble.fanp.co."
+        record: "pebble.fanp.co"
+        type: 'A'
+        ttl: 60
+        value: "{{ ec2_info.instances[0].public_ip_address }}"
+        wait: yes
+        wait_timeout: 180  # seconds
+      delegate_to: localhost
+
+- hosts: launched
+  gather_facts: true
+  become: true
+  tasks:
+    - name: Install Python and NGINX
+      apt:
+        pkg:
+          - python3-pip
+          - nginx
+        update_cache: yes
+
+    - name: Install FastAPI and Uvicorn
+      pip:
+        name:
+          - fastapi
+          - uvicorn
+
+    - name: Clone FastAPI app from GitHub repository
+      git:
+        # uses a public repo to skip over ssh key or user/pw checks
+        repo: 'https://github.com/fampton/pebblebe.git'
+        dest: '/home/ubuntu/fastapi-app'
+        version: main
+
+    - name: Disable default NGINX site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Create NGINX configuration for FastAPI
+      ansible.builtin.copy:
+          dest: /etc/nginx/sites-available/fastapi
+          content: |
+            server {
+              listen 80;
+              # underscore as catchall
+              server_name _;
+      
+              location / {
+                # default fastapi port is 8000
+                # port also specified in systemd template
+                proxy_pass http://localhost:8000;
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection "upgrade";
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+              }
+            }
+      notify: restart nginx
+      
+    - name: Enable FastAPI site by creating symlink in sites-enabled
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/fastapi
+        dest: /etc/nginx/sites-enabled/fastapi
+        state: link
+    
+    - name: Restart NGINX to apply changes
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+
+    - name: Create systemd service file for FastAPI app
+      become: yes
+      template:
+        src: fastapi.service.j2
+        dest: /etc/systemd/system/fastapi.service
+      notify: Reload systemd
+    
+    - name: Enable and start FastAPI service
+      become: yes
+      systemd:
+        name: fastapi
+        enabled: yes
+        state: started
+
+  handlers:
+    - name: restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+# Commands to redeploy app with newest code from github main branch
+- hosts: localhost
+  gather_facts: true
+  tasks: 
+    - name: Register host
+      amazon.aws.ec2_instance_info:
+        filters:
+          "tag:Name": "{{ instance_tag_name }}"
+        region: "us-east-1"
+      register: ec2_info
+      tags: ["redeploy"]
+
+    - name: Add new instance to host group
+      add_host:
+        hostname: "{{ ec2_info.instances[0].public_ip_address }}"
+        groupname: redeploy
+        ansible_user: ubuntu
+        ansible_ssh_private_key_file: "/home/admin/pebble-key.pem"
+      tags: ["redeploy"]
+
+- hosts: redeploy
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Mark FastAPI app directory as a safe directory in Git
+      ansible.builtin.shell:
+        cmd: git config --global --add safe.directory /home/ubuntu/fastapi-app
+      tags: ["redeploy"]
+
+    - name: Ensure correct ownership of the FastAPI app directory
+      ansible.builtin.file:
+        path: /home/ubuntu/fastapi-app
+        owner: ubuntu
+        group: ubuntu
+        recurse: yes
+      tags: ["redeploy"]
+
+    - name: Update FastAPI app from GitHub repository
+      tags: ["redeploy"]
+      git:
+        repo: 'https://github.com/fampton/pebblebe.git'
+        dest: '/home/ubuntu/fastapi-app'
+        version: main
+        # Forces git to discard local changes and fetch the latest commit
+        force: yes
+
+    - name: Restart FastAPI service to apply new changes
+      tags: ["redeploy"]
+      become: yes
+      systemd:
+        name: fastapi
+        state: restarted
