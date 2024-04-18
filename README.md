@@ -18,4 +18,4 @@ make deploy
 
 ./ssh_to_webapp_ec2.sh
 
-## Additional Information - The webapp's IP can be found in `webapp_ip.txt` after the Ansible run completes.  ## Code View the Ansible code and supporting files at: https://github.com/fampton/pebbleinfra
+### Additional Information - The webapp's IP can be found in `webapp_ip.txt` after the Ansible run completes.
